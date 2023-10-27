@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,6 +15,42 @@ import matplotlib.pyplot as plt
 
 device = 'cuda:0'
 
+def train_mcflcs(server, clients, t_round, n_epoch):
+    acc, loss = [], []
+    acc_, loss_ = server.test()
+    acc.append(acc_), loss.append(loss_)
+    for t in range(t_round):
+        logger.info(f"Transmission {t+1} begins")
+        local_weights = []
+        for idx, client in enumerate(clients):
+            w_i_t = client.local_step(n_epoch)
+            local_weights.append(w_i_t)
+        server.aggregate(local_weights)
+        for client in fedcon_clients:
+            client.set_weight(deepcopy(server.get_weight()))
+        acc_, loss_ = server.test()
+        logger.info(f"Transmission {t+1} ends: acc={acc}, loss={loss}")
+        acc.append(acc_), loss.append(loss_)
+    return acc, loss
+
+def train_fedavg(server, clients, t_round, n_epoch):
+    for t in range(t_round):
+        acc, loss = [], []
+        acc_, loss_ = server.test()
+        acc.append(acc_), loss.append(loss_)
+        logger.info(f"Transmission {t+1} begins")
+        local_weights = []
+        for client in clients:
+            w_i = client.local_step(n_epoch)
+            local_weights.append(deepcopy(w_i))
+        server.aggregate(local_weights)
+        acc, loss = server.test()
+        for client in clients:
+            client.set_weight(deepcopy(server.get_weight()))
+        logger.info(f"Transmission {t + 1} ends: acc={acc}, loss={loss}")
+        acc.append(acc), loss.append(loss)
+
+def plot_contrast(*lists):
 
 if __name__ == '__main__':
     training_data = datasets.CIFAR10(
@@ -28,75 +66,22 @@ if __name__ == '__main__':
         download=True,
         transform=ToTensor(),
     )
-    client_size = 2
-    transmission_round = 10
-    local_epoch_size = 1
+    client_size = 10
+    transmission_round = 25
+    local_epoch_size = 5
 
-    iid_partition = CIFAR10Partitioner(training_data.targets, client_size, balance=True, partition="iid")
-    # diri_partition = CIFAR10Partitioner(training_data.targets, client_size, balance=True, partition="dirichlet", dir_alpha=0.3)
+    partition = CIFAR10Partitioner(training_data.targets, client_size, balance=True, partition="iid")
+    dataset = [torch.utils.data.Subset(training_data, partition[i]) for i in range(client_size)]
+    test_dataloader = DataLoader(test_data, batch_size=64)
+    train_dataloader = [DataLoader(dataset[i], batch_size=64, shuffle=True) for i in range(client_size)]
 
-    iid_set = [torch.utils.data.Subset(training_data, iid_partition[i]) for i in range(client_size)]
-    # dirichlet_set = [torch.utils.data.Subset(training_data, diri_partition[i]) for i in range(client_size)]
-
-    test_dataloader = DataLoader(test_data, batch_size=128)
-    iid_train_dataloader = [DataLoader(iid_set[i], batch_size=128) for i in range(client_size)]
-    # non_iid_train_dataloader = [DataLoader(dirichlet_set[i], batch_size=64) for i in range(client_size)]
+    fedavg_clients = [FedavgClient(resnet18().to(device), train_dataloader[i], test_dataloader, i) for i in range(client_size)]
+    server = FedavgServer(FedconNet(base="resnet18").to(device), test_dataloader)
+    fedcon_clients = [FedconClient(FedconNet(base="resnet18").to(device),
+                                   train_dataloader[i], test_dataloader, i) for i in range(client_size)]
 
 
-    iid_clients = [FedavgClient(SimpleCnn(input_dim=16*5*5, hidden_dims=[120, 84], out_dim=10).to(device), iid_train_dataloader[i]) for i in range(client_size)]
-    # non_iid_clients = [FedavgClient(SimpleCnn(input_dim=16*5*5, hidden_dims=[120, 84], out_dim=10).to(device), non_iid_train_dataloader[i]) for i in range(client_size)]
-    server = FedavgServer(FedconNet().to(device), test_dataloader)
-    clients = [FedconClient(FedconNet().to(device),
-                            iid_train_dataloader[i], i) for i in range(client_size)]
 
-    fedcon_acc = []
-    fedcon_loss = []
-    acc, loss = server.test()
-    fedcon_acc.append(acc), fedcon_loss.append(loss)
-
-    for t in range(transmission_round):
-        logger.info(f"Transmission {t+1} begins")
-        local_weights = []
-        for idx, client in enumerate(clients):
-            client.local_step(n_epoch=local_epoch_size)
-            torch.save(client.get_weight(), f"./params/fedcon{idx}.pth")
-        for idx in range(client_size):
-            local_weights.append(torch.load(f"./params/fedcon{idx}.pth"))
-        server.aggregate(local_weights)
-        torch.save(server.get_weight(), "./params/fedcon-server.pth")
-        for client in clients:
-            client.set_weight(torch.load("./params/fedcon-server.pth"))
-        acc, loss = server.test()
-        logger.warning(f"Transmission {t+1} ends: acc={acc}, loss={loss}")
-        fedcon_acc.append(acc), fedcon_loss.append(loss)
-
-    server = FedavgServer(SimpleCnn(input_dim=16 * 5 * 5, hidden_dims=[120, 84], out_dim=10).to(device),
-                          test_dataloader)
-    acc, loss = server.test()
-    fedavg_acc = []
-    fedavg_loss = []
-    fedavg_acc.append(acc), fedavg_loss.append(loss)
-
-    for t in range(transmission_round):
-        logger.info(f"Transmission {t+1} begins")
-        local_weights = []
-        cl = 0
-        for client in iid_clients:
-            logger.info(f"Client {client} begins")
-            for epoch in range(local_epoch_size):
-                loss = client.train()
-                logger.debug(f"Epoch {epoch + 1}: loss={loss:>.03}")
-            torch.save(client.get_weight(), f"./params/fedavg{cl}.pth")
-            cl += 1
-        for idx in range(client_size):
-            local_weights.append(torch.load(f"./params/fedavg{idx}.pth"))
-        server.aggregate(local_weights)
-        acc, loss = server.test()
-        torch.save(server.get_weight(), "./params/fedavg-server.pth")
-        for client in iid_clients:
-            client.set_weight(torch.load("./params/fedavg-server.pth"))
-        logger.warning(f"Transmission {t + 1} ends: acc={acc}, loss={loss}")
-        fedavg_acc.append(acc), fedavg_loss.append(loss)
 
     plt.plot(fedavg_acc, color="blue")
     plt.plot(fedcon_acc, color="red")

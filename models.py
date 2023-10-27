@@ -1,5 +1,9 @@
+import numpy as np
+import torch
 import torch.nn as nn
-    
+from torchvision.models import resnet18
+
+
 class SimpleCnnHeader(nn.Module):
     def __init__(self, input_dim, hidden_dims=[]):
         super().__init__()
@@ -7,26 +11,26 @@ class SimpleCnnHeader(nn.Module):
         self.relu = nn.ReLU()
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
-
+        self.flatten = nn.Flatten()
         self.fc1 = nn.Linear(input_dim, hidden_dims[0])
         self.fc2 = nn.Linear(hidden_dims[0], hidden_dims[1])
 
     def forward(self, x):
         x = self.pool(self.relu(self.conv1(x)))
         x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
+        x = self.flatten(x)
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         return x
 
 class SimpleCnn(nn.Module):
-    def __init__(self, input_dim, hidden_dims, out_dim):
+    def __init__(self, input_dim=16*5*5, hidden_dims=[120, 84], out_dim=10):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.conv1 = nn.Conv2d(1, 6, 5)
         self.relu = nn.ReLU()
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
-
+        self.flatten = nn.Flatten()
         self.fc1 = nn.Linear(input_dim, hidden_dims[0])
         self.fc2 = nn.Linear(hidden_dims[0], hidden_dims[1])
         self.fc3 = nn.Linear(hidden_dims[1], out_dim)
@@ -34,7 +38,7 @@ class SimpleCnn(nn.Module):
     def forward(self, x):
         x = self.pool(self.relu(self.conv1(x)))
         x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
+        x = self.flatten(x)
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         x = self.fc3(x)
@@ -47,11 +51,17 @@ class FedconNet(nn.Module):
     2. Project Head
     3. Output Layer
     """
-    def __init__(self, input_dim=16*5*5, hidden_dims=[120, 84], out_dim=256, n_classes=10) -> None:
+
+    def __init__(self, input_dim=16*5*5, hidden_dims=[120, 84], out_dim=256, n_classes=10, base="cnn") -> None:
         super().__init__()
 
-        self.base = SimpleCnnHeader(input_dim=input_dim, hidden_dims=hidden_dims)
-        n_features = 84
+        if base == "cnn":
+            self.base = SimpleCnnHeader(input_dim=input_dim, hidden_dims=hidden_dims)
+            n_features = 84
+        elif base == "resnet18":
+            self.base = nn.Sequential(*list(resnet18().children())[:-1])
+            n_features = 512
+
 
         self.proj = nn.Sequential(
             nn.Linear(n_features, n_features),
