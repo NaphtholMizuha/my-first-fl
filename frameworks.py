@@ -10,20 +10,6 @@ from loguru import logger
 import utils
 from models import FedconNet
 from utils import dct_mat
-
-class DatasetSplit(Dataset):
-    def __init__(self, dataset, idx_dict):
-        self.dataset = dataset
-        self.idxs = list(idx_dict)
-
-    def __len__(self):
-        return len(self.idxs)
-
-    def __getitem__(self, item):
-        (images1, images2), labels = self.dataset[self.idxs[item]]
-        return (images1, images2), labels
-
-
 class FlServer(ABC):
     """
     abstract base class representing server in FL
@@ -79,12 +65,12 @@ class FedavgClient(FlClient):
         :param mu: hyperparameter for the impact of contrastive learning
         :return: local weight after training
         """
-        logger.debug(f"Client {self.idx} begins")
+        # logger.debug(f"Client {self.idx} begins")
         for epoch in range(n_epoch):
             loss = self.train()
-            logger.debug(f"Epoch {epoch + 1}: loss={loss:.5}")
-        acc, loss = self.test()
-        logger.debug(f"Client {self.idx} ends: acc={acc}, loss={loss}")
+            # logger.debug(f"Epoch {epoch + 1}: loss={loss:.5}")
+        # acc, loss = self.test()
+        # logger.debug(f"Client {self.idx} ends: acc={acc}, loss={loss}")
         return self.get_weight()
 
     def test(self):
@@ -129,15 +115,10 @@ class FedavgClient(FlClient):
         """
         self.model.load_state_dict(w)
 
-
 class FedconClient(FlClient):
-    table = {}
 
-    def __init__(self, model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, idx: int, n_compress=100,
-                 n_chunk=200):
+    def __init__(self, model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, idx: int):
         super().__init__()
-        self.n_chunk = n_chunk
-        self.n_compress = n_compress
         self.test_loader = test_loader
         self.model = model.to('cuda')
         self.model_prev = copy.deepcopy(model).to('cuda')
@@ -147,21 +128,9 @@ class FedconClient(FlClient):
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         self.criterion = nn.CrossEntropyLoss().to("cuda")
 
-    # @staticmethod
-    # def loss_con(z: torch.Tensor, z_prev: torch.Tensor, z_glob: torch.Tensor, temperature):
-    #     cos = nn.CosineSimilarity(dim=-1)
-    #     pos = cos(z, z_glob).reshape(-1, 1)  # positive samples
-    #     pos /= temperature
-    #     neg = cos(z, z_prev).reshape(-1, 1)  # negative samples
-    #     neg /= temperature
-    #     return torch.log(torch.exp(pos) / torch.exp(pos) + torch.exp(neg))
 
     def get_weight(self):
-        w = self.model.state_dict()
-        w = utils.pack(w, self.n_chunk, self.table)
-        w = utils.compress(w, self.n_chunk, self.n_compress, self.table)
-        w = utils.differential_privacy(w, self.threshold, self.std)
-        return w
+        return self.model.state_dict()
 
     def set_weight(self, weight: dict):
         self.model.load_state_dict(weight)
@@ -176,13 +145,13 @@ class FedconClient(FlClient):
         :param mu: hyperparameter for the impact of contrastive learning
         :return: local weight after training
         """
-        logger.debug(f"Client {self.idx} begins")
+        # logger.debug(f"Client {self.idx} begins")
         temp = copy.deepcopy(self.model.state_dict())
         for epoch in range(n_epoch):
             loss, loss1, loss2 = self.train(temperature, mu)
-            logger.debug(f"Epoch {epoch + 1}: loss={loss:.5}, loss_sup={loss1:.5}, loss_con={loss2:.5}")
-        acc, loss = self.test()
-        logger.debug(f"Client {self.idx} ends: acc={acc}, loss={loss}")
+            # logger.debug(f"Epoch {epoch + 1}: loss={loss:.5}, loss_sup={loss1:.5}, loss_con={loss2:.5}")
+        # acc, loss = self.test()
+        # logger.debug(f"Client {self.idx} ends: acc={acc}, loss={loss}")
         self.model_prev.load_state_dict(temp)
         self.model_prev.eval()
         return self.get_weight()
@@ -207,7 +176,6 @@ class FedconClient(FlClient):
             labels = torch.zeros(x.size(0)).to('cuda').long()
             loss1 = self.criterion(y_pred, y)
             loss2 = mu * self.criterion(logits, labels)
-            # loss2 = mu * self.loss_con(z, z_prev, z_glob, temperature)
             loss = loss1 + loss2
             loss.backward()
             self.optimizer.step()
@@ -236,9 +204,31 @@ class FedconClient(FlClient):
         correct /= size
         return correct, test_loss
 
+class McflcsClient(FedconClient):
+    table = {}
+
+    def __init__(self, model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, idx: int, n_compress=100,
+                 n_chunk=200, threshold=2, privacy_budget=1, n_comm=25, n_client=10):
+        super().__init__(model, train_loader, test_loader, idx)
+        self.n_client = n_client
+        self.n_comm = n_comm
+        self.n_chunk = n_chunk
+        self.n_compress = int(n_compress)
+        self.threshold = threshold
+        self.epsilon = privacy_budget
+
+    def get_weight(self):
+        w, w_prev = self.model.state_dict(), self.model_prev.state_dict()
+        w = utils.pack(w, self.n_chunk, self.table)
+        w_prev = utils.pack(w_prev, self.n_chunk, self.table)
+        w = w - w_prev
+        w = utils.compress(w, self.n_chunk, self.n_compress)
+        w = utils.differential_privacy(w, self.n_client, self.n_comm, self.threshold, self.epsilon)
+        return w
 
 class FedavgServer(FlServer):
-    def __init__(self, model: nn.Module, test_dataloader: DataLoader):
+    def __init__(self, model: nn.Module, test_dataloader: DataLoader, freq):
+        self.freq = freq
         self.criterion = nn.CrossEntropyLoss()
         self.test_dataloader = test_dataloader
         self.model = model
@@ -259,10 +249,10 @@ class FedavgServer(FlServer):
         for idx, weight in enumerate(weights):
             if idx == 0:
                 for key in weight.keys():
-                    ans[key] = weight[key] / size
+                    ans[key] = weight[key] * self.freq[idx]
             else:
                 for key in weight.keys():
-                    ans[key] += weight[key] / size
+                    ans[key] += weight[key] * self.freq[idx]
         self.set_weight(ans)
         self.model.eval()
 
@@ -284,14 +274,15 @@ class FedavgServer(FlServer):
         correct /= size
         return correct, test_loss
 
-class FedconServer(FedavgServer):
+class McflcsServer(FedavgServer):
     table = {}
-    def __init__(self, model: nn.Module, test_dataloader: DataLoader, n_compress=100,
-                 n_chunk=200, rho=0.1, eta=0.1):
-        super.__init__(model, test_dataloader)
+    def __init__(self, model: nn.Module, test_dataloader: DataLoader, freq, n_compress=100,
+                 n_chunk=200, rho=0.1, eta=0.1, n_clients=10):
+        super().__init__(model, test_dataloader, freq)
+        self.n_clients = n_clients
         self.eta = eta
         self.n_chunk = n_chunk
-        self.n_compress = n_compress
+        self.n_compress = int(n_compress)
         self.momentum = None
         self.residual = None
         self.rho = rho
@@ -303,12 +294,13 @@ class FedconServer(FedavgServer):
     #     self.model.load_state_dict()
 
     def aggregate(self, weights: list):
-        weights = torch.stack(weights)
-        y = torch.mean(weights, dim=0)
+        y = torch.zeros(weights[0].size()).to('cuda')
+        for i, weight in enumerate(weights):
+            y += self.freq[i] * weight
         if self.momentum is None:
-            self.momentum = torch.zeros(weights[0].shape)
+            self.momentum = torch.zeros(weights[0].shape).to('cuda')
         if self.residual is None:
-            self.residual = torch.zeros(weights[0].shape)
+            self.residual = torch.zeros(weights[0].shape).to('cuda')
         self.momentum = y + self.rho * self.momentum
         self.residual += self.eta * self.momentum
         s = utils.reconstruct(self.residual, self.n_chunk, self.n_compress)
